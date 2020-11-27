@@ -6,8 +6,6 @@ import (
 	"sync"
 	"time"
 
-	objectutil "github.com/bookingcom/shipper/pkg/util/object"
-
 	corev1 "k8s.io/api/core/v1"
 
 	releaseconditions "github.com/bookingcom/shipper/pkg/util/release"
@@ -45,7 +43,7 @@ type Controller struct {
 	shipperClientset clientset.Interface
 
 	appLastModifiedTimes     map[string]*appLastModifiedTimeEntry
-	appLastModifiedTimesLock sync.Mutex
+	appLastModifiedTimesLock sync.RWMutex
 
 	metricsBundle *MetricsBundle
 }
@@ -79,6 +77,8 @@ func NewController(
 
 		recorder:      recorder,
 		metricsBundle: metricsBundle,
+
+		appLastModifiedTimes: make(map[string]*appLastModifiedTimeEntry),
 	}
 
 	appInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -179,24 +179,43 @@ func (c *Controller) handleReleaseUpdates(old, new interface{}) {
 		return
 	}
 
-	// If the chart wasn't installed and now it is, calculate how
-	// long it took. The chart is always installed on step 0, so
-	// return if we've passed that step
+	// metrics-controller cares only when the following conditions apply:
+	// 1. We are at the step 0, because the chart is always installed at step 0
+	// 2. The release that generates the event is a contender
+	// 3. The old release has not achieved installation and the new release has
+	//    achived installation. In other words, we want to keep track of the event
+	//    that updates the "contender achived installation" status to true.
+
+	// See condition (1)
 	if newRelease.Spec.TargetStep > 0 {
+		return
+	}
+
+	// See condition (2)
+	// if !isContender(newRelease) {
+	// return
+	// }
+
+	// See condition (3). If Status.Strategy.Conditions is nil just ignore
+	if oldRelease.Status.Strategy == nil ||
+		oldRelease.Status.Strategy.Conditions == nil ||
+		newRelease.Status.Strategy == nil ||
+		newRelease.Status.Strategy.Conditions == nil {
 		return
 	}
 
 	oldInstallationCondition := releaseconditions.GetReleaseStrategyConditionByType(oldRelease.Status.Strategy, shipper.StrategyConditionContenderAchievedInstallation)
 	newInstallationCondition := releaseconditions.GetReleaseStrategyConditionByType(newRelease.Status.Strategy, shipper.StrategyConditionContenderAchievedInstallation)
-	if newInstallationCondition != nil {
+
+	if oldInstallationCondition == nil || newInstallationCondition == nil {
 		return
 	}
 
-	if oldInstallationCondition != nil && oldInstallationCondition.Status == corev1.ConditionTrue {
-		// This release has already achieved installation, so ignore
+	// See condition (3). This release has already achieved installation, so ignore
+	if oldInstallationCondition.Status == corev1.ConditionTrue {
 		return
 	}
-
+	// See condition (3). The new release will not update the installation status, so ignore
 	if newInstallationCondition.Status == corev1.ConditionFalse {
 		return
 	}
@@ -207,14 +226,16 @@ func (c *Controller) handleReleaseUpdates(old, new interface{}) {
 		klog.Errorf("Failed to get release key: %q", err)
 	}
 
-	appName, err := objectutil.GetApplicationLabel(newRelease)
-	if err != nil {
+	appName, ok := newRelease.GetLabels()[shipper.AppLabel]
+	if !ok || len(appName) == 0 {
 		klog.Errorf("Could not find application name for Release %q", releaseName)
 	}
 
+	c.appLastModifiedTimesLock.RLock()
 	lastModifiedTime, ok := c.appLastModifiedTimes[appName]
+	c.appLastModifiedTimesLock.RUnlock()
 	if !ok {
-		// This probably means the 8informer didn't
+		// This probably means the informer didn't
 		// run our application create/update callback,
 		// so silently ignore the error
 		return
