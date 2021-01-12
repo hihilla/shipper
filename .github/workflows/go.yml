@@ -50,7 +50,7 @@ jobs:
 
     - name: Kustomize
       run: curl -s "https://raw.githubusercontent.com/\
-          kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"  | bash
+          kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" > install_kustomize.sh && chmod +x install_kustomize.sh && ./install_kustomize.sh
       shell: bash
 
     - name: Setup-clusters
